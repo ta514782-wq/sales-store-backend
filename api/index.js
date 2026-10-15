@@ -27,6 +27,8 @@ const DASHBOARDS = {
   peak_hours: { view: 'v_peak_hours' },
   order_status: { view: 'v_order_status' },
   lost_revenue: { view: 'v_lost_revenue' },
+  inventory_status: { view: 'v_inventory_status' },
+  low_stock: { view: 'v_low_stock' },
 };
 
 const wrap = (fn) => (req, res) =>
@@ -115,4 +117,3 @@ app.post('/api/users', auth, superOnly, wrap(async (req, res) => {
 }));
 
 module.exports = app;
-  
