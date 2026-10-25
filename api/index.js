@@ -10,7 +10,7 @@ const pool = new Pool({
 });
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '3mb' }));
 
 // Dashboards that support date + category filters. They read from CTE "f" (filtered orders).
 const FILTER_CTE = `WITH f AS (
@@ -213,8 +213,8 @@ app.get('/api/me', auth, wrap(async (req, res) => {
   res.json(out);
 }));
 
-app.get('/api/categories', auth, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT category_name FROM categories ORDER BY 1');
+app.get('/api/categories', auth, store, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT category_name FROM categories WHERE store_id = $1 ORDER BY 1', [req.storeId]);
   res.json(rows.map((r) => r.category_name));
 }));
 
@@ -327,13 +327,13 @@ app.get('/api/stores', auth, platformOnly, wrap(async (req, res) => {
 }));
 
 app.post('/api/stores', auth, platformOnly, async (req, res) => {
-  const { store_name, city, admin_name, admin_email, admin_password } = req.body || {};
+  const { store_name, city, admin_name, admin_email, admin_password, copy_from } = req.body || {};
   if (!store_name || !admin_name || !admin_email || !admin_password || admin_password.length < 8)
     return res.status(400).json({ error: 'Store name, admin name, admin email and an 8+ character password are required' });
   const c = await pool.connect();
   try {
     await c.query('BEGIN');
-    const s1 = await c.query('SELECT fn_create_store($1, $2) AS sid', [store_name.trim(), city || null]);
+    const s1 = await c.query('SELECT fn_create_store($1, $2, $3) AS sid', [store_name.trim(), city || null, Number.isInteger(copy_from) ? copy_from : null]);
     const sid = s1.rows[0].sid;
     const hash = await bcrypt.hash(admin_password, 10);
     const u = await c.query(
@@ -369,17 +369,265 @@ const dbMsg = (e, res) => {
   res.status(500).json({ error: 'Server error' });
 };
 
+const cleanText = (v, max) => String(v == null ? '' : v).replace(/[\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim();
+const pick = (r, names) => {
+  for (const n of names) if (r[n] !== undefined && r[n] !== null && String(r[n]).trim() !== '') return String(r[n]).trim();
+  return '';
+};
+const MAX_ROWS = 2000;
+async function ensureCategory(c, storeId, name) {
+  const r = await c.query('SELECT category_id FROM categories WHERE store_id = $1 AND lower(category_name) = lower($2)', [storeId, name]);
+  if (r.rowCount) return r.rows[0].category_id;
+  const n = await c.query('INSERT INTO categories (store_id, category_name) VALUES ($1,$2) RETURNING category_id', [storeId, name]);
+  return n.rows[0].category_id;
+}
+const importAudit = (c, req, action, details) =>
+  c.query(`INSERT INTO audit_log (store_id, user_id, action, table_name, details) VALUES ($1,$2,$3,'import',$4)`,
+    [req.storeId, req.user.id, action, JSON.stringify(details)]);
+const importRows = (req, res) => {
+  const rows = Array.isArray(req.body && req.body.rows) ? req.body.rows : null;
+  if (!rows || !rows.length) { res.status(400).json({ error: 'No data rows found. The file needs a header line and at least one data line.' }); return null; }
+  if (rows.length > MAX_ROWS) { res.status(400).json({ error: `Too many rows (maximum ${MAX_ROWS} per import)` }); return null; }
+  return rows;
+};
+const importFail = (res, errs) =>
+  res.status(400).json({ error: `Fix ${errs.length} problem(s) and try again. Nothing was imported.`, errors: errs.slice(0, 20) });
+
+// ----- prices, products, tax -----
 app.get('/api/products', auth, store, allow('super_admin', 'store_manager', 'inventory'), wrap(async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT p.product_id, p.product_name, c.category_name, COALESCE(i.stock_qty,0) AS stock_qty
-     FROM products p JOIN categories c USING (category_id)
-     LEFT JOIN inventory i ON i.product_id = p.product_id AND i.store_id = $1
-     ORDER BY c.category_name, p.product_name`,
+    `SELECT p.product_id, p.product_name, c.category_name, p.unit_price,
+            COALESCE(i.stock_qty,0) AS stock_qty, st.tax_rate
+     FROM products p
+     JOIN categories c ON c.category_id = p.category_id
+     JOIN stores st ON st.store_id = p.store_id
+     LEFT JOIN inventory i ON i.product_id = p.product_id AND i.store_id = p.store_id
+     WHERE p.store_id = $1 AND p.is_active ORDER BY c.category_name, p.product_name`,
     [req.storeId]
   );
   res.json(rows);
 }));
 
+app.get('/api/store-settings', auth, store, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT store_name, city, tax_rate FROM stores WHERE store_id = $1', [req.storeId]);
+  res.json(rows[0]);
+}));
+
+app.patch('/api/store-settings', auth, store, allow('super_admin'), wrap(async (req, res) => {
+  const t = Number(req.body && req.body.tax_rate);
+  if (!(t >= 0 && t <= 100)) return res.status(400).json({ error: 'Tax rate must be between 0 and 100' });
+  await pool.query('UPDATE stores SET tax_rate = $1 WHERE store_id = $2', [t, req.storeId]);
+  res.json({ ok: true });
+}));
+
+app.post('/api/products', auth, store, allow('super_admin', 'inventory'), wrap(async (req, res) => {
+  const b = req.body || {};
+  const name = cleanText(b.product_name), cat = cleanText(b.category);
+  const price = Number(b.unit_price);
+  const stock = b.opening_stock === undefined || b.opening_stock === '' ? 0 : Number(b.opening_stock);
+  if (!name || name.length > 120 || !cat || cat.length > 60 || !(price >= 0 && price <= 1e9) || !Number.isInteger(stock) || stock < 0)
+    return res.status(400).json({ error: 'Enter a name, a category, a price (0 or more) and a whole-number opening stock' });
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const cid = await ensureCategory(c, req.storeId, cat);
+    const ins = await c.query(
+      `INSERT INTO products (store_id, product_name, category_id, unit_price) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (store_id, product_name) DO NOTHING RETURNING product_id`,
+      [req.storeId, name, cid, price]
+    );
+    if (!ins.rowCount) { await c.query('ROLLBACK'); return res.status(400).json({ error: 'A product with that name already exists' }); }
+    const pid = ins.rows[0].product_id;
+    if (stock > 0) {
+      await c.query('UPDATE inventory SET stock_qty = $1, last_updated = now() WHERE store_id = $2 AND product_id = $3', [stock, req.storeId, pid]);
+      await c.query(`INSERT INTO stock_movements (store_id, product_id, change_qty, reason, created_by) VALUES ($1,$2,$3,'opening_stock',$4)`,
+        [req.storeId, pid, stock, req.user.id]);
+    }
+    await c.query('COMMIT');
+    res.status(201).json({ product_id: pid });
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    c.release();
+  }
+}));
+
+app.patch('/api/products/:id', auth, store, allow('super_admin', 'inventory'), wrap(async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { unit_price, is_active } = req.body || {};
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad product' });
+  const sets = [], vals = [];
+  if (unit_price !== undefined) {
+    const p = Number(unit_price);
+    if (!(p >= 0 && p <= 1e9)) return res.status(400).json({ error: 'Price must be 0 or more' });
+    vals.push(p); sets.push('unit_price = $' + vals.length);
+  }
+  if (is_active !== undefined) { vals.push(!!is_active); sets.push('is_active = $' + vals.length); }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to change' });
+  vals.push(id, req.storeId);
+  const r = await pool.query(`UPDATE products SET ${sets.join(', ')} WHERE product_id = $${vals.length - 1} AND store_id = $${vals.length}`, vals);
+  if (!r.rowCount) return res.status(404).json({ error: 'Product not found' });
+  res.json({ ok: true });
+}));
+
+// ----- CSV imports (all or nothing: one bad row cancels the whole import) -----
+app.post('/api/import/products', auth, store, allow('super_admin', 'inventory'), wrap(async (req, res) => {
+  const rows = importRows(req, res); if (!rows) return;
+  const errs = [], seen = new Set(), items = [];
+  rows.forEach((r, i) => {
+    const n = 'Row ' + (i + 1);
+    const name = cleanText(pick(r, ['product_name', 'name', 'product']));
+    const cat = cleanText(pick(r, ['category', 'category_name']));
+    const priceRaw = pick(r, ['unit_price', 'price']);
+    const stockRaw = pick(r, ['opening_stock', 'stock', 'quantity']);
+    const reoRaw = pick(r, ['reorder_level', 'reorder']);
+    const price = Number(priceRaw), stock = stockRaw === '' ? 0 : Number(stockRaw), reorder = reoRaw === '' ? null : Number(reoRaw);
+    if (!name) errs.push(`${n}: product name is empty`);
+    else if (name.length > 120) errs.push(`${n}: product name is too long`);
+    else if (seen.has(name.toLowerCase())) errs.push(`${n}: "${name}" appears twice in the file`);
+    seen.add(name.toLowerCase());
+    if (!cat || cat.length > 60) errs.push(`${n}: category is empty or too long`);
+    if (priceRaw === '' || !(price >= 0 && price <= 1e9)) errs.push(`${n}: price must be a number, 0 or more`);
+    if (!Number.isInteger(stock) || stock < 0) errs.push(`${n}: opening stock must be a whole number, 0 or more`);
+    if (reorder !== null && (!Number.isInteger(reorder) || reorder < 0)) errs.push(`${n}: reorder level must be a whole number`);
+    items.push({ name, cat, price, stock, reorder });
+  });
+  if (errs.length) return importFail(res, errs);
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    // reuse existing category and product names (any capital letters), create the rest
+    const ec = await c.query('SELECT category_name FROM categories WHERE store_id = $1', [req.storeId]);
+    const catMap = new Map(ec.rows.map((r) => [r.category_name.toLowerCase(), r.category_name]));
+    const ep = await c.query('SELECT product_name FROM products WHERE store_id = $1', [req.storeId]);
+    const prodMap = new Map(ep.rows.map((r) => [r.product_name.toLowerCase(), r.product_name]));
+    const newCats = new Set();
+    items.forEach((it) => {
+      const ck = it.cat.toLowerCase();
+      if (catMap.has(ck)) it.cat = catMap.get(ck); else { catMap.set(ck, it.cat); newCats.add(it.cat); }
+      const pk = it.name.toLowerCase();
+      if (prodMap.has(pk)) it.name = prodMap.get(pk);
+    });
+    if (newCats.size)
+      await c.query('INSERT INTO categories (store_id, category_name) SELECT $1, x FROM unnest($2::text[]) x ON CONFLICT (store_id, category_name) DO NOTHING', [req.storeId, [...newCats]]);
+    const up = await c.query(
+      `INSERT INTO products (store_id, product_name, category_id, unit_price, is_active)
+       SELECT $1, t.name, c.category_id, t.price, TRUE
+       FROM unnest($2::text[], $3::text[], $4::numeric[]) AS t(name, cat, price)
+       JOIN categories c ON c.store_id = $1 AND c.category_name = t.cat
+       ON CONFLICT (store_id, product_name)
+       DO UPDATE SET unit_price = EXCLUDED.unit_price, category_id = EXCLUDED.category_id, is_active = TRUE
+       RETURNING product_id, product_name, (xmax = 0) AS inserted`,
+      [req.storeId, items.map((x) => x.name), items.map((x) => x.cat), items.map((x) => x.price)]
+    );
+    const byName = new Map(items.map((i) => [i.name, i]));
+    const created = up.rows.filter((r) => r.inserted);
+    const ids = [], stk = [], reo = [];
+    created.forEach((r) => {
+      const it = byName.get(r.product_name);
+      ids.push(r.product_id); stk.push(it.stock); reo.push(it.reorder === null ? 100 : it.reorder);
+    });
+    if (ids.length) {
+      await c.query(
+        `UPDATE inventory i SET stock_qty = t.stk, reorder_level = t.reo, last_updated = now()
+         FROM unnest($2::int[], $3::int[], $4::int[]) AS t(pid, stk, reo)
+         WHERE i.store_id = $1 AND i.product_id = t.pid`,
+        [req.storeId, ids, stk, reo]
+      );
+      await c.query(
+        `INSERT INTO stock_movements (store_id, product_id, change_qty, reason, created_by)
+         SELECT $1, t.pid, t.stk, 'opening_stock', $4 FROM unnest($2::int[], $3::int[]) AS t(pid, stk) WHERE t.stk > 0`,
+        [req.storeId, ids, stk, req.user.id]
+      );
+    }
+    await importAudit(c, req, 'import_products', { rows: items.length, created: created.length, updated: up.rows.length - created.length });
+    await c.query('COMMIT');
+    res.json({ created: created.length, updated: up.rows.length - created.length });
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    c.release();
+  }
+}));
+
+app.post('/api/import/customers', auth, store, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
+  const rows = importRows(req, res); if (!rows) return;
+  const errs = [], names = [], ages = [], genders = [];
+  rows.forEach((r, i) => {
+    const n = 'Row ' + (i + 1);
+    const name = cleanText(pick(r, ['customer_name', 'name']));
+    const age = Number(pick(r, ['age']));
+    const g = pick(r, ['gender', 'sex']).toLowerCase();
+    const gender = ['m', 'male'].includes(g) ? 'Male' : ['f', 'female'].includes(g) ? 'Female' : null;
+    if (!name || name.length > 120) errs.push(`${n}: name is empty or too long`);
+    if (!Number.isInteger(age) || age < 10 || age > 100) errs.push(`${n}: age must be a whole number from 10 to 100`);
+    if (!gender) errs.push(`${n}: gender must be Male or Female`);
+    names.push(name); ages.push(age); genders.push(gender);
+  });
+  if (errs.length) return importFail(res, errs);
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query(
+      `INSERT INTO customers (customer_id, customer_name, age, gender, store_id)
+       SELECT 'CUST' || nextval('customer_seq'), t.name, t.age, t.gender, $1
+       FROM unnest($2::text[], $3::int[], $4::text[]) AS t(name, age, gender)`,
+      [req.storeId, names, ages, genders]
+    );
+    await importAudit(c, req, 'import_customers', { rows: names.length });
+    await c.query('COMMIT');
+    res.json({ created: names.length });
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    c.release();
+  }
+}));
+
+app.post('/api/import/stock', auth, store, allow('super_admin', 'inventory'), wrap(async (req, res) => {
+  const rows = importRows(req, res); if (!rows) return;
+  const prods = await pool.query('SELECT product_id, product_name FROM products WHERE store_id = $1 AND is_active', [req.storeId]);
+  const idByName = new Map(prods.rows.map((p) => [p.product_name.toLowerCase(), p.product_id]));
+  const errs = [], add = new Map();
+  rows.forEach((r, i) => {
+    const n = 'Row ' + (i + 1);
+    const name = cleanText(pick(r, ['product_name', 'name', 'product']));
+    const q = Number(pick(r, ['quantity', 'qty', 'stock']));
+    const pid = idByName.get(name.toLowerCase());
+    if (!pid) errs.push(`${n}: product "${name}" was not found in this store`);
+    if (!Number.isInteger(q) || q < 1) errs.push(`${n}: quantity must be a whole number, 1 or more`);
+    if (pid && Number.isInteger(q) && q >= 1) add.set(pid, (add.get(pid) || 0) + q);
+  });
+  if (errs.length) return importFail(res, errs);
+  const ids = [...add.keys()], qty = ids.map((k) => add.get(k));
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query(
+      `UPDATE inventory i SET stock_qty = i.stock_qty + t.q, last_updated = now()
+       FROM unnest($2::int[], $3::int[]) AS t(pid, q) WHERE i.store_id = $1 AND i.product_id = t.pid`,
+      [req.storeId, ids, qty]
+    );
+    await c.query(
+      `INSERT INTO stock_movements (store_id, product_id, change_qty, reason, created_by)
+       SELECT $1, t.pid, t.q, 'restock', $4 FROM unnest($2::int[], $3::int[]) AS t(pid, q)`,
+      [req.storeId, ids, qty, req.user.id]
+    );
+    await importAudit(c, req, 'import_stock', { products: ids.length });
+    await c.query('COMMIT');
+    res.json({ updated: ids.length });
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    c.release();
+  }
+}));
+
+// ----- customers and orders -----
 app.get('/api/customers', auth, store, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
   const q = '%' + (req.query.q || '') + '%';
   const { rows } = await pool.query(
@@ -391,28 +639,82 @@ app.get('/api/customers', auth, store, allow('super_admin', 'store_manager'), wr
   res.json(rows);
 }));
 
-app.post('/api/orders', auth, store, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
-  const { customer_id, product_id, quantity, total_price, payment_mode } = req.body || {};
-  if (!customer_id || !Number.isInteger(product_id) || !Number.isInteger(quantity) || quantity < 1 ||
-      typeof total_price !== 'number' || !(total_price >= 0) || !PAY.includes(payment_mode))
-    return res.status(400).json({ error: 'Fill customer, product, quantity (1+), total price and payment mode' });
-  const id = 'TXN' + (100000 + Math.floor(Math.random() * 900000));
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO orders (transaction_id, customer_id, product_id, quantity, total_price, payment_mode,
-                           purchase_date, purchase_time, status, store_id)
-       VALUES ($1,$2,$3,$4,$5,$6,(now() AT TIME ZONE 'Asia/Karachi')::date,
-               (now() AT TIME ZONE 'Asia/Karachi')::time(0),'pending',$7)
-       ON CONFLICT DO NOTHING RETURNING transaction_id`,
-      [id, customer_id, product_id, quantity, total_price, payment_mode, req.storeId]
-    );
-    if (!rows.length) return res.status(409).json({ error: 'Please try again' });
-    res.status(201).json({ transaction_id: rows[0].transaction_id });
-  } catch (e) {
-    if (e.code === '23503') return res.status(400).json({ error: 'Customer or product not found in this store' });
-    throw e;
-  }
+app.post('/api/customers', auth, store, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
+  const { customer_name, age, gender } = req.body || {};
+  const name = cleanText(customer_name);
+  if (!name || name.length > 120 || !Number.isInteger(age) || age < 10 || age > 100 || !['Male', 'Female'].includes(gender))
+    return res.status(400).json({ error: 'Enter a name, an age (10-100) and a gender' });
+  const { rows } = await pool.query(
+    `INSERT INTO customers (customer_id, customer_name, age, gender, store_id)
+     VALUES ('CUST' || nextval('customer_seq')::text, $1, $2, $3, $4) RETURNING customer_id, customer_name`,
+    [name, age, gender, req.storeId]
+  );
+  res.status(201).json(rows[0]);
 }));
+
+app.get('/api/orders', auth, store, allow('super_admin', 'store_manager', 'logistics'), wrap(async (req, res) => {
+  const st = STATUSES.includes(req.query.status) ? req.query.status : null;
+  const q = '%' + (req.query.q || '') + '%';
+  const { rows } = await pool.query(
+    `SELECT o.transaction_id, cu.customer_name, p.product_name, o.quantity, o.total_price,
+            o.status, o.purchase_date, o.purchase_time
+     FROM orders o LEFT JOIN customers cu USING (customer_id) JOIN products p USING (product_id)
+     WHERE o.store_id = $3 AND ($1::text IS NULL OR o.status = $1) AND o.transaction_id ILIKE $2
+     ORDER BY o.purchase_date DESC NULLS LAST, o.purchase_time DESC NULLS LAST LIMIT 30`,
+    [st, q, req.storeId]
+  );
+  res.json(rows);
+}));
+
+// one order with full price breakdown (for the receipt)
+app.get('/api/orders/:id', auth, store, allow('super_admin', 'store_manager', 'logistics'), wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT o.transaction_id, o.status, o.purchase_date, o.purchase_time, o.quantity, o.subtotal, o.discount,
+            o.tax, o.total_price, o.payment_mode, cu.customer_name, p.product_name, s.store_name, s.city,
+            CASE WHEN o.subtotal IS NOT NULL THEN round(o.subtotal / o.quantity, 2) END AS unit_price
+     FROM orders o JOIN stores s ON s.store_id = o.store_id
+     JOIN products p ON p.product_id = o.product_id
+     LEFT JOIN customers cu ON cu.customer_id = o.customer_id
+     WHERE o.transaction_id = $1 AND o.store_id = $2`,
+    [req.params.id, req.storeId]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Order not found' });
+  res.json(rows[0]);
+}));
+
+// the price is calculated by the database (fn_place_order), not sent by the browser
+app.post('/api/orders', auth, store, allow('super_admin', 'store_manager'), async (req, res) => {
+  const { customer_id, product_id, quantity, discount_pct, payment_mode } = req.body || {};
+  const disc = discount_pct === undefined || discount_pct === '' ? 0 : Number(discount_pct);
+  if (!customer_id || !Number.isInteger(product_id) || !Number.isInteger(quantity) || quantity < 1 ||
+      !(disc >= 0 && disc <= 100) || !PAY.includes(payment_mode))
+    return res.status(400).json({ error: 'Fill customer, product, quantity (1+), discount (0-100) and payment mode' });
+  try {
+    const r = await pool.query('SELECT fn_place_order($1,$2,$3,$4,$5,$6) AS tid',
+      [req.storeId, customer_id, product_id, quantity, disc, payment_mode]);
+    const o = await pool.query('SELECT transaction_id, subtotal, discount, tax, total_price FROM orders WHERE transaction_id = $1', [r.rows[0].tid]);
+    res.status(201).json(o.rows[0]);
+  } catch (e) {
+    dbMsg(e, res);
+  }
+});
+
+// change order status (rules: pending -> delivered/cancelled, delivered -> returned)
+app.post('/api/orders', auth, store, allow('super_admin', 'store_manager'), async (req, res) => {
+  const { customer_id, product_id, quantity, discount_pct, payment_mode } = req.body || {};
+  const disc = discount_pct === undefined || discount_pct === '' ? 0 : Number(discount_pct);
+  if (!customer_id || !Number.isInteger(product_id) || !Number.isInteger(quantity) || quantity < 1 ||
+      !(disc >= 0 && disc <= 100) || !PAY.includes(payment_mode))
+    return res.status(400).json({ error: 'Fill customer, product, quantity (1+), discount (0-100) and payment mode' });
+  try {
+    const r = await pool.query('SELECT fn_place_order($1,$2,$3,$4,$5,$6) AS tid',
+      [req.storeId, customer_id, product_id, quantity, disc, payment_mode]);
+    const o = await pool.query('SELECT transaction_id, subtotal, discount, tax, total_price FROM orders WHERE transaction_id = $1', [r.rows[0].tid]);
+    res.status(201).json(o.rows[0]);
+  } catch (e) {
+    dbMsg(e, res);
+  }
+});
 
 // change order status (rules: pending -> delivered/cancelled, delivered -> returned)
 app.patch('/api/orders/:id/status', auth, store, allow('super_admin', 'store_manager', 'logistics'), async (req, res) => {
@@ -459,3 +761,4 @@ app.post('/api/restock', auth, store, allow('super_admin', 'inventory'), async (
 });
 
 module.exports = app;
+                                            
