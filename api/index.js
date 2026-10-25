@@ -22,6 +22,7 @@ const FILTER_CTE = `WITH f AS (
   WHERE ($1::date IS NULL OR o.purchase_date >= $1::date)
     AND ($2::date IS NULL OR o.purchase_date <= $2::date)
     AND ($3::text IS NULL OR c.category_name = $3)
+    AND o.store_id = $4
 ) `;
 const Q = {
   overview: `SELECT count(*) AS total_orders,
@@ -125,20 +126,41 @@ function auth(req, res, next) {
   const t = (req.headers.authorization || '').replace('Bearer ', '');
   try {
     req.user = jwt.verify(t, process.env.JWT_SECRET);
+    // store users are tied to their own store; the platform admin chooses one with the X-Store-Id header
+    if (req.user.role === 'platform_admin') {
+      const sid = parseInt(req.headers['x-store-id'], 10);
+      req.storeId = Number.isInteger(sid) ? sid : null;
+    } else {
+      req.storeId = req.user.store_id || null;
+    }
     next();
   } catch {
     res.status(401).json({ error: 'Please log in' });
   }
 }
 const superOnly = (req, res, next) =>
-  req.user.role === 'super_admin' ? next() : res.status(403).json({ error: 'Super admin only' });
+  ['super_admin', 'platform_admin'].includes(req.user.role) ? next() : res.status(403).json({ error: 'Store admin only' });
+const platformOnly = (req, res, next) =>
+  req.user.role === 'platform_admin' ? next() : res.status(403).json({ error: 'Platform admin only' });
+// every store-scoped route runs this: the store must exist and be active
+async function store(req, res, next) {
+  try {
+    if (!req.storeId) return res.status(400).json({ error: 'Choose a store first' });
+    const r = await pool.query('SELECT 1 FROM stores WHERE store_id = $1 AND is_active', [req.storeId]);
+    if (!r.rowCount) return res.status(403).json({ error: 'Store not available' });
+    next();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+}
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.post('/api/login', wrap(async (req, res) => {
   const { email, password } = req.body || {};
   const { rows } = await pool.query(
-    `SELECT u.user_id, u.full_name, u.password_hash, u.is_active, u.failed_attempts, u.locked_until,
+    `SELECT u.user_id, u.full_name, u.password_hash, u.is_active, u.failed_attempts, u.locked_until, u.store_id,
             r.role_id, r.role_name
      FROM users u JOIN roles r USING (role_id) WHERE lower(u.email) = lower($1)`,
     [email || '']
@@ -171,7 +193,7 @@ app.post('/api/login', wrap(async (req, res) => {
   if (u.failed_attempts > 0 || u.locked_until)
     await pool.query('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE user_id = $1', [u.user_id]);
   const token = jwt.sign(
-    { id: u.user_id, role_id: u.role_id, role: u.role_name, name: u.full_name },
+    { id: u.user_id, role_id: u.role_id, role: u.role_name, name: u.full_name, store_id: u.store_id },
     process.env.JWT_SECRET,
     { expiresIn: '8h' }
   );
@@ -180,11 +202,15 @@ app.post('/api/login', wrap(async (req, res) => {
 
 // who am I + which dashboards can I open
 app.get('/api/me', auth, wrap(async (req, res) => {
-  const { rows } = await pool.query(
-    'SELECT dashboard_key FROM role_dashboards WHERE role_id = $1 ORDER BY 1',
-    [req.user.role_id]
-  );
-  res.json({ name: req.user.name, role: req.user.role, dashboards: rows.map((r) => r.dashboard_key) });
+  const d = await pool.query('SELECT dashboard_key FROM role_dashboards WHERE role_id = $1 ORDER BY 1', [req.user.role_id]);
+  const out = { name: req.user.name, role: req.user.role, dashboards: d.rows.map((r) => r.dashboard_key), store: null };
+  if (req.user.role === 'platform_admin') {
+    out.stores = (await pool.query('SELECT store_id, store_name FROM stores WHERE is_active ORDER BY store_id')).rows;
+  } else if (req.user.store_id) {
+    const x = await pool.query('SELECT store_id, store_name FROM stores WHERE store_id = $1', [req.user.store_id]);
+    if (x.rows[0]) out.store = { id: x.rows[0].store_id, name: x.rows[0].store_name };
+  }
+  res.json(out);
 }));
 
 app.get('/api/categories', auth, wrap(async (req, res) => {
@@ -211,7 +237,7 @@ app.post('/api/change-password', auth, wrap(async (req, res) => {
 }));
 
 // data for one dashboard (only if this role is allowed). Optional: ?from=&to=&category=&format=csv
-app.get('/api/dashboard/:key', auth, wrap(async (req, res) => {
+app.get('/api/dashboard/:key', auth, store, wrap(async (req, res) => {
   const key = req.params.key;
   if (!Q[key] && !VIEWS[key] && key !== 'sales_forecast') return res.status(404).json({ error: 'Unknown dashboard' });
   const ok = await pool.query(
@@ -231,10 +257,10 @@ app.get('/api/dashboard/:key', auth, wrap(async (req, res) => {
            COALESCE(sum(o.total_price) FILTER (WHERE o.status='delivered' AND ($1::text IS NULL OR c.category_name=$1)),0) AS revenue,
            count(*) FILTER (WHERE $1::text IS NULL OR c.category_name=$1) AS orders
          FROM orders o JOIN products p USING (product_id) JOIN categories c USING (category_id)
-         WHERE o.purchase_date IS NOT NULL
+         WHERE o.purchase_date IS NOT NULL AND o.store_id = $2
          GROUP BY 1 HAVING count(*) >= 30
          ORDER BY 1 DESC LIMIT 12`,
-        [cat]
+        [cat, req.storeId]
       );
       const hist = rows.reverse();
       if (hist.length < 4) return res.status(400).json({ error: 'Not enough monthly history to forecast' });
@@ -244,10 +270,10 @@ app.get('/api/dashboard/:key', auth, wrap(async (req, res) => {
       out.push({ month: f.next_month, type: 'forecast (3-month avg)', revenue: f.ma3, orders: null, low: null, high: null });
       payload = { key, rows: out, forecast: f };
     } else if (Q[key]) {
-      const { rows } = await pool.query(FILTER_CTE + Q[key], [from, to, cat]);
+      const { rows } = await pool.query(FILTER_CTE + Q[key], [from, to, cat, req.storeId]);
       payload = { key, rows };
     } else {
-      const { rows } = await pool.query(`SELECT * FROM ${VIEWS[key]}`);
+      const { rows } = await pool.query(`SELECT * FROM ${VIEWS[key]} WHERE store_id = $1`, [req.storeId]);
       payload = { key, rows };
     }
   } catch (e) {
@@ -262,33 +288,78 @@ app.get('/api/dashboard/:key', auth, wrap(async (req, res) => {
   res.json(payload);
 }));
 
-// user management (super admin only)
-app.get('/api/users', auth, superOnly, wrap(async (req, res) => {
+// user management (store admin: own store; platform admin: the selected store)
+app.get('/api/users', auth, store, superOnly, wrap(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT u.user_id, u.full_name, u.email, r.role_name, u.is_active
-     FROM users u JOIN roles r USING (role_id) ORDER BY u.user_id`
+     FROM users u JOIN roles r USING (role_id) WHERE u.store_id = $1 ORDER BY u.user_id`,
+    [req.storeId]
   );
   res.json(rows);
 }));
 
-app.post('/api/users', auth, superOnly, wrap(async (req, res) => {
+app.post('/api/users', auth, store, superOnly, wrap(async (req, res) => {
   const { full_name, email, password, role_name } = req.body || {};
   if (!full_name || !email || !password || password.length < 8 || !role_name)
     return res.status(400).json({ error: 'Name, email, role and a password of 8+ characters are required' });
+  if (role_name === 'platform_admin') return res.status(403).json({ error: 'Not allowed' });
   const hash = await bcrypt.hash(password, 10);
   const { rows } = await pool.query(
-    `INSERT INTO users (full_name, email, password_hash, role_id)
-     SELECT $1, $2, $3, role_id FROM roles WHERE role_name = $4
+    `INSERT INTO users (full_name, email, password_hash, role_id, store_id)
+     SELECT $1, $2, $3, role_id, $5 FROM roles WHERE role_name = $4
      ON CONFLICT (email) DO NOTHING RETURNING user_id`,
-    [full_name, email, hash, role_name]
+    [full_name, email, hash, role_name, req.storeId]
   );
   if (!rows.length) return res.status(400).json({ error: 'Email already used or role not found' });
   res.status(201).json({ user_id: rows[0].user_id });
 }));
 
-// ---------- daily operations ----------
+// ---------- stores (platform admin) ----------
+app.get('/api/stores', auth, platformOnly, wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT s.store_id, s.store_name, s.city,
+       (SELECT count(*) FROM orders o WHERE o.store_id = s.store_id) AS orders,
+       (SELECT COALESCE(sum(o.total_price),0) FROM orders o WHERE o.store_id = s.store_id AND o.status = 'delivered') AS revenue,
+       (SELECT count(*) FROM users u WHERE u.store_id = s.store_id) AS users
+     FROM stores s WHERE s.is_active ORDER BY s.store_id`
+  );
+  res.json(rows);
+}));
+
+app.post('/api/stores', auth, platformOnly, async (req, res) => {
+  const { store_name, city, admin_name, admin_email, admin_password } = req.body || {};
+  if (!store_name || !admin_name || !admin_email || !admin_password || admin_password.length < 8)
+    return res.status(400).json({ error: 'Store name, admin name, admin email and an 8+ character password are required' });
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const s1 = await c.query('SELECT fn_create_store($1, $2) AS sid', [store_name.trim(), city || null]);
+    const sid = s1.rows[0].sid;
+    const hash = await bcrypt.hash(admin_password, 10);
+    const u = await c.query(
+      `INSERT INTO users (full_name, email, password_hash, role_id, store_id)
+       SELECT $1, $2, $3, role_id, $4 FROM roles WHERE role_name = 'super_admin'
+       ON CONFLICT (email) DO NOTHING RETURNING user_id`,
+      [admin_name, admin_email, hash, sid]
+    );
+    if (!u.rowCount) { await c.query('ROLLBACK'); return res.status(400).json({ error: 'That admin email is already used' }); }
+    await c.query('COMMIT');
+    res.status(201).json({ store_id: sid });
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {});
+    if (e.code === '23505') return res.status(400).json({ error: 'A store with that name already exists' });
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    c.release();
+  }
+});
+
+// ---------- daily operations (all scoped to one store) ----------
 const allow = (...roles) => (req, res, next) =>
-  roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Your role cannot do this' });
+  roles.includes(req.user.role) || req.user.role === 'platform_admin'
+    ? next()
+    : res.status(403).json({ error: 'Your role cannot do this' });
 const STATUSES = ['pending', 'delivered', 'cancelled', 'returned'];
 const PAY = ['Cash', 'UPI', 'EMI', 'Debit Card', 'Credit Card'];
 const NEXT = { pending: ['delivered', 'cancelled'], delivered: ['returned'] }; // allowed status changes
@@ -298,40 +369,29 @@ const dbMsg = (e, res) => {
   res.status(500).json({ error: 'Server error' });
 };
 
-app.get('/api/products', auth, allow('super_admin', 'store_manager', 'inventory'), wrap(async (req, res) => {
+app.get('/api/products', auth, store, allow('super_admin', 'store_manager', 'inventory'), wrap(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT p.product_id, p.product_name, c.category_name, COALESCE(i.stock_qty,0) AS stock_qty
-     FROM products p JOIN categories c USING (category_id) LEFT JOIN inventory i USING (product_id)
-     ORDER BY c.category_name, p.product_name`
+     FROM products p JOIN categories c USING (category_id)
+     LEFT JOIN inventory i ON i.product_id = p.product_id AND i.store_id = $1
+     ORDER BY c.category_name, p.product_name`,
+    [req.storeId]
   );
   res.json(rows);
 }));
 
-app.get('/api/customers', auth, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
+app.get('/api/customers', auth, store, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
   const q = '%' + (req.query.q || '') + '%';
   const { rows } = await pool.query(
     `SELECT customer_id, customer_name FROM customers
-     WHERE customer_id ILIKE $1 OR customer_name ILIKE $1 ORDER BY customer_name LIMIT 15`,
-    [q]
+     WHERE store_id = $2 AND (customer_id ILIKE $1 OR customer_name ILIKE $1)
+     ORDER BY customer_name LIMIT 15`,
+    [q, req.storeId]
   );
   res.json(rows);
 }));
 
-app.get('/api/orders', auth, allow('super_admin', 'store_manager', 'logistics'), wrap(async (req, res) => {
-  const st = STATUSES.includes(req.query.status) ? req.query.status : null;
-  const q = '%' + (req.query.q || '') + '%';
-  const { rows } = await pool.query(
-    `SELECT o.transaction_id, cu.customer_name, p.product_name, o.quantity, o.total_price,
-            o.status, o.purchase_date, o.purchase_time
-     FROM orders o LEFT JOIN customers cu USING (customer_id) JOIN products p USING (product_id)
-     WHERE ($1::text IS NULL OR o.status = $1) AND o.transaction_id ILIKE $2
-     ORDER BY o.purchase_date DESC NULLS LAST, o.purchase_time DESC NULLS LAST LIMIT 30`,
-    [st, q]
-  );
-  res.json(rows);
-}));
-
-app.post('/api/orders', auth, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
+app.post('/api/orders', auth, store, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
   const { customer_id, product_id, quantity, total_price, payment_mode } = req.body || {};
   if (!customer_id || !Number.isInteger(product_id) || !Number.isInteger(quantity) || quantity < 1 ||
       typeof total_price !== 'number' || !(total_price >= 0) || !PAY.includes(payment_mode))
@@ -340,34 +400,37 @@ app.post('/api/orders', auth, allow('super_admin', 'store_manager'), wrap(async 
   try {
     const { rows } = await pool.query(
       `INSERT INTO orders (transaction_id, customer_id, product_id, quantity, total_price, payment_mode,
-                           purchase_date, purchase_time, status)
+                           purchase_date, purchase_time, status, store_id)
        VALUES ($1,$2,$3,$4,$5,$6,(now() AT TIME ZONE 'Asia/Karachi')::date,
-               (now() AT TIME ZONE 'Asia/Karachi')::time(0),'pending')
+               (now() AT TIME ZONE 'Asia/Karachi')::time(0),'pending',$7)
        ON CONFLICT DO NOTHING RETURNING transaction_id`,
-      [id, customer_id, product_id, quantity, total_price, payment_mode]
+      [id, customer_id, product_id, quantity, total_price, payment_mode, req.storeId]
     );
     if (!rows.length) return res.status(409).json({ error: 'Please try again' });
     res.status(201).json({ transaction_id: rows[0].transaction_id });
   } catch (e) {
-    if (e.code === '23503') return res.status(400).json({ error: 'Customer or product not found' });
+    if (e.code === '23503') return res.status(400).json({ error: 'Customer or product not found in this store' });
     throw e;
   }
 }));
 
 // change order status (rules: pending -> delivered/cancelled, delivered -> returned)
-app.patch('/api/orders/:id/status', auth, allow('super_admin', 'store_manager', 'logistics'), async (req, res) => {
+app.patch('/api/orders/:id/status', auth, store, allow('super_admin', 'store_manager', 'logistics'), async (req, res) => {
   const { status } = req.body || {};
   const c = await pool.connect();
   try {
     await c.query('BEGIN');
-    const cur = await c.query('SELECT status FROM orders WHERE transaction_id = $1 FOR UPDATE', [req.params.id]);
+    const cur = await c.query(
+      'SELECT status FROM orders WHERE transaction_id = $1 AND store_id = $2 FOR UPDATE',
+      [req.params.id, req.storeId]
+    );
     if (!cur.rowCount) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Order not found' }); }
     const from = cur.rows[0].status;
     if (!(NEXT[from] || []).includes(status)) {
       await c.query('ROLLBACK');
       return res.status(400).json({ error: `A ${from} order cannot become ${status}` });
     }
-    await c.query('UPDATE orders SET status = $1 WHERE transaction_id = $2', [status, req.params.id]);
+    await c.query('UPDATE orders SET status = $1 WHERE transaction_id = $2 AND store_id = $3', [status, req.params.id, req.storeId]);
     await c.query(
       `UPDATE audit_log SET user_id = $1 WHERE audit_id =
          (SELECT max(audit_id) FROM audit_log WHERE action = 'status_change' AND record_id = $2)`,
@@ -383,12 +446,12 @@ app.patch('/api/orders/:id/status', auth, allow('super_admin', 'store_manager', 
   }
 });
 
-app.post('/api/restock', auth, allow('super_admin', 'inventory'), async (req, res) => {
+app.post('/api/restock', auth, store, allow('super_admin', 'inventory'), async (req, res) => {
   const { product_id, quantity } = req.body || {};
   if (!Number.isInteger(product_id) || !Number.isInteger(quantity) || quantity < 1)
     return res.status(400).json({ error: 'Choose a product and a quantity of 1 or more' });
   try {
-    const { rows } = await pool.query('SELECT fn_restock($1,$2,$3) AS new_stock', [product_id, quantity, req.user.id]);
+    const { rows } = await pool.query('SELECT fn_restock($1,$2,$3,$4) AS new_stock', [req.storeId, product_id, quantity, req.user.id]);
     res.json({ new_stock: rows[0].new_stock });
   } catch (e) {
     dbMsg(e, res);
@@ -396,4 +459,3 @@ app.post('/api/restock', auth, allow('super_admin', 'inventory'), async (req, re
 });
 
 module.exports = app;
-    
