@@ -122,21 +122,35 @@ const wrap = (fn) => (req, res) =>
     res.status(500).json({ error: 'Server error' });
   });
 
-function auth(req, res, next) {
+async function auth(req, res, next) {
   const t = (req.headers.authorization || '').replace('Bearer ', '');
+  let tok;
   try {
-    req.user = jwt.verify(t, process.env.JWT_SECRET);
-    // store users are tied to their own store; the platform admin chooses one with the X-Store-Id header
-    if (req.user.role === 'platform_admin') {
-      const sid = parseInt(req.headers['x-store-id'], 10);
-      req.storeId = Number.isInteger(sid) ? sid : null;
-    } else {
-      req.storeId = req.user.store_id || null;
-    }
-    next();
+    tok = jwt.verify(t, process.env.JWT_SECRET);
   } catch {
-    res.status(401).json({ error: 'Please log in' });
+    return res.status(401).json({ error: 'Please log in' });
   }
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.user_id, u.full_name, u.is_active, u.store_id, r.role_id, r.role_name
+       FROM users u JOIN roles r USING (role_id) WHERE u.user_id = $1`,
+      [tok.id]
+    );
+    const u = rows[0];
+    if (!u || !u.is_active) return res.status(401).json({ error: 'Your account is not active' });
+    req.user = { id: u.user_id, name: u.full_name, role: u.role_name, role_id: u.role_id, store_id: u.store_id };
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+  // store users are tied to their own store; the platform admin chooses one with the X-Store-Id header
+  if (req.user.role === 'platform_admin') {
+    const sid = parseInt(req.headers['x-store-id'], 10);
+    req.storeId = Number.isInteger(sid) ? sid : null;
+  } else {
+    req.storeId = req.user.store_id || null;
+  }
+  next();
 }
 const superOnly = (req, res, next) =>
   ['super_admin', 'platform_admin'].includes(req.user.role) ? next() : res.status(403).json({ error: 'Store admin only' });
@@ -203,7 +217,7 @@ app.post('/api/login', wrap(async (req, res) => {
 // who am I + which dashboards can I open
 app.get('/api/me', auth, wrap(async (req, res) => {
   const d = await pool.query('SELECT dashboard_key FROM role_dashboards WHERE role_id = $1 ORDER BY 1', [req.user.role_id]);
-  const out = { name: req.user.name, role: req.user.role, dashboards: d.rows.map((r) => r.dashboard_key), store: null };
+  const out = { id: req.user.id, name: req.user.name, role: req.user.role, dashboards: d.rows.map((r) => r.dashboard_key), store: null };
   if (req.user.role === 'platform_admin') {
     out.stores = (await pool.query('SELECT store_id, store_name FROM stores WHERE is_active ORDER BY store_id')).rows;
   } else if (req.user.store_id) {
@@ -312,6 +326,55 @@ app.post('/api/users', auth, store, superOnly, wrap(async (req, res) => {
   );
   if (!rows.length) return res.status(400).json({ error: 'Email already used or role not found' });
   res.status(201).json({ user_id: rows[0].user_id });
+}));
+
+app.patch('/api/users/:id', auth, store, superOnly, wrap(async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { role_name, is_active, new_password } = req.body || {};
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad user' });
+  if (id === req.user.id) return res.status(400).json({ error: 'You cannot change your own account here. Use the Password tab.' });
+  const cur = await pool.query(
+    `SELECT u.user_id, u.is_active, r.role_name FROM users u JOIN roles r USING (role_id)
+     WHERE u.user_id = $1 AND u.store_id = $2`,
+    [id, req.storeId]
+  );
+  if (!cur.rowCount) return res.status(404).json({ error: 'User not found in this store' });
+  const target = cur.rows[0];
+  const sets = [], vals = [], changed = [];
+  if (role_name !== undefined) {
+    if (role_name === 'platform_admin') return res.status(403).json({ error: 'Not allowed' });
+    const rr = await pool.query('SELECT role_id FROM roles WHERE role_name = $1', [role_name]);
+    if (!rr.rowCount) return res.status(400).json({ error: 'Unknown role' });
+    vals.push(rr.rows[0].role_id); sets.push('role_id = $' + vals.length); changed.push('role');
+  }
+  if (is_active !== undefined) {
+    vals.push(!!is_active); sets.push('is_active = $' + vals.length); changed.push('active');
+    if (is_active) sets.push('failed_attempts = 0', 'locked_until = NULL');
+  }
+  if (new_password !== undefined) {
+    if (typeof new_password !== 'string' || new_password.length < 8)
+      return res.status(400).json({ error: 'The new password must be at least 8 characters' });
+    vals.push(await bcrypt.hash(new_password, 10)); sets.push('password_hash = $' + vals.length); changed.push('password');
+  }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to change' });
+  // every store keeps at least one active store admin
+  const losesAdmin = target.role_name === 'super_admin' && target.is_active &&
+    ((role_name !== undefined && role_name !== 'super_admin') || is_active === false);
+  if (losesAdmin) {
+    const n = await pool.query(
+      `SELECT count(*) AS n FROM users u JOIN roles r USING (role_id)
+       WHERE u.store_id = $1 AND r.role_name = 'super_admin' AND u.is_active`,
+      [req.storeId]
+    );
+    if (Number(n.rows[0].n) <= 1) return res.status(400).json({ error: 'Every store needs at least one active store admin' });
+  }
+  vals.push(id);
+  await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE user_id = $${vals.length}`, vals);
+  await pool.query(
+    `INSERT INTO audit_log (store_id, user_id, action, table_name, record_id, details) VALUES ($1,$2,'user_update','users',$3,$4)`,
+    [req.storeId, req.user.id, String(id), JSON.stringify({ changed })]
+  );
+  res.json({ ok: true });
 }));
 
 // ---------- stores (platform admin) ----------
@@ -700,23 +763,6 @@ app.post('/api/orders', auth, store, allow('super_admin', 'store_manager'), asyn
 });
 
 // change order status (rules: pending -> delivered/cancelled, delivered -> returned)
-app.post('/api/orders', auth, store, allow('super_admin', 'store_manager'), async (req, res) => {
-  const { customer_id, product_id, quantity, discount_pct, payment_mode } = req.body || {};
-  const disc = discount_pct === undefined || discount_pct === '' ? 0 : Number(discount_pct);
-  if (!customer_id || !Number.isInteger(product_id) || !Number.isInteger(quantity) || quantity < 1 ||
-      !(disc >= 0 && disc <= 100) || !PAY.includes(payment_mode))
-    return res.status(400).json({ error: 'Fill customer, product, quantity (1+), discount (0-100) and payment mode' });
-  try {
-    const r = await pool.query('SELECT fn_place_order($1,$2,$3,$4,$5,$6) AS tid',
-      [req.storeId, customer_id, product_id, quantity, disc, payment_mode]);
-    const o = await pool.query('SELECT transaction_id, subtotal, discount, tax, total_price FROM orders WHERE transaction_id = $1', [r.rows[0].tid]);
-    res.status(201).json(o.rows[0]);
-  } catch (e) {
-    dbMsg(e, res);
-  }
-});
-
-// change order status (rules: pending -> delivered/cancelled, delivered -> returned)
 app.patch('/api/orders/:id/status', auth, store, allow('super_admin', 'store_manager', 'logistics'), async (req, res) => {
   const { status } = req.body || {};
   const c = await pool.connect();
@@ -760,5 +806,155 @@ app.post('/api/restock', auth, store, allow('super_admin', 'inventory'), async (
   }
 });
 
+// ---------- suppliers and purchase orders ----------
+const BUY = ['super_admin', 'inventory'];
+app.get('/api/suppliers', auth, store, allow('super_admin', 'inventory', 'store_manager'), wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT supplier_id, supplier_name, phone, city, is_active FROM suppliers WHERE store_id = $1 ORDER BY supplier_name',
+    [req.storeId]
+  );
+  res.json(rows);
+}));
+
+app.post('/api/suppliers', auth, store, allow(...BUY), wrap(async (req, res) => {
+  const b = req.body || {};
+  const name = cleanText(b.supplier_name), phone = cleanText(b.phone), city = cleanText(b.city);
+  if (!name || name.length > 120) return res.status(400).json({ error: 'Enter the supplier name' });
+  const { rows } = await pool.query(
+    `INSERT INTO suppliers (store_id, supplier_name, phone, city) VALUES ($1,$2,$3,$4)
+     ON CONFLICT (store_id, supplier_name) DO NOTHING RETURNING supplier_id`,
+    [req.storeId, name, phone || null, city || null]
+  );
+  if (!rows.length) return res.status(400).json({ error: 'A supplier with that name already exists' });
+  res.status(201).json({ supplier_id: rows[0].supplier_id });
+}));
+
+app.patch('/api/suppliers/:id', auth, store, allow(...BUY), wrap(async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || typeof (req.body || {}).is_active !== 'boolean') return res.status(400).json({ error: 'Bad request' });
+  const r = await pool.query('UPDATE suppliers SET is_active = $1 WHERE supplier_id = $2 AND store_id = $3', [req.body.is_active, id, req.storeId]);
+  if (!r.rowCount) return res.status(404).json({ error: 'Supplier not found' });
+  res.json({ ok: true });
+}));
+
+// products that are low on stock, with a suggested order quantity
+app.get('/api/purchase-orders/suggestions', auth, store, allow(...BUY), wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT p.product_id, p.product_name, i.stock_qty, i.reorder_level,
+            GREATEST(i.reorder_level * 2 - i.stock_qty, 1) AS suggested_qty
+     FROM inventory i JOIN products p ON p.product_id = i.product_id AND p.store_id = i.store_id
+     WHERE i.store_id = $1 AND p.is_active AND i.stock_qty <= i.reorder_level
+     ORDER BY i.stock_qty LIMIT 50`,
+    [req.storeId]
+  );
+  res.json(rows);
+}));
+
+app.get('/api/purchase-orders', auth, store, allow('super_admin', 'inventory', 'store_manager'), wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT po.po_id, s.supplier_name, po.status, po.created_at,
+            count(i.product_id) AS lines, COALESCE(sum(i.qty_ordered * i.unit_cost), 0) AS total_cost
+     FROM purchase_orders po
+     JOIN suppliers s ON s.supplier_id = po.supplier_id AND s.store_id = po.store_id
+     LEFT JOIN purchase_order_items i ON i.po_id = po.po_id
+     WHERE po.store_id = $1 GROUP BY po.po_id, s.supplier_name ORDER BY po.po_id DESC LIMIT 30`,
+    [req.storeId]
+  );
+  res.json(rows);
+}));
+
+app.get('/api/purchase-orders/:id', auth, store, allow('super_admin', 'inventory', 'store_manager'), wrap(async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad purchase order' });
+  const h = await pool.query(
+    `SELECT po.po_id, po.status, po.notes, po.created_at, po.received_at, s.supplier_name
+     FROM purchase_orders po JOIN suppliers s ON s.supplier_id = po.supplier_id AND s.store_id = po.store_id
+     WHERE po.po_id = $1 AND po.store_id = $2`,
+    [id, req.storeId]
+  );
+  if (!h.rowCount) return res.status(404).json({ error: 'Purchase order not found' });
+  const l = await pool.query(
+    `SELECT i.product_id, p.product_name, i.qty_ordered, i.qty_received, i.unit_cost
+     FROM purchase_order_items i JOIN products p ON p.product_id = i.product_id AND p.store_id = i.store_id
+     WHERE i.po_id = $1 ORDER BY p.product_name`,
+    [id]
+  );
+  res.json({ ...h.rows[0], lines: l.rows });
+}));
+
+app.post('/api/purchase-orders', auth, store, allow(...BUY), wrap(async (req, res) => {
+  const { supplier_id, notes, items } = req.body || {};
+  if (!Number.isInteger(supplier_id) || !Array.isArray(items) || !items.length || items.length > 200)
+    return res.status(400).json({ error: 'Choose a supplier and add at least one product' });
+  const pids = [], qtys = [], costs = [], seen = new Set();
+  for (const it of items) {
+    const pid = it.product_id, q = it.qty;
+    const c = it.unit_cost === undefined || it.unit_cost === '' ? 0 : Number(it.unit_cost);
+    if (!Number.isInteger(pid) || !Number.isInteger(q) || q < 1 || q > 1000000 || !(c >= 0 && c <= 1e9))
+      return res.status(400).json({ error: 'Each line needs a product, a whole quantity of 1 or more, and a cost of 0 or more' });
+    if (seen.has(pid)) return res.status(400).json({ error: 'A product appears twice in this order' });
+    seen.add(pid); pids.push(pid); qtys.push(q); costs.push(c);
+  }
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const h = await c.query(
+      `INSERT INTO purchase_orders (store_id, supplier_id, notes, created_by)
+       SELECT $1, s.supplier_id, $3, $4 FROM suppliers s
+       WHERE s.supplier_id = $2 AND s.store_id = $1 AND s.is_active RETURNING po_id`,
+      [req.storeId, supplier_id, cleanText(notes).slice(0, 300) || null, req.user.id]
+    );
+    if (!h.rowCount) { await c.query('ROLLBACK'); return res.status(400).json({ error: 'Supplier not found in this store' }); }
+    const po = h.rows[0].po_id;
+    await c.query(
+      `INSERT INTO purchase_order_items (po_id, store_id, product_id, qty_ordered, unit_cost)
+       SELECT $1, $2, t.pid, t.q, t.c FROM unnest($3::int[], $4::int[], $5::numeric[]) AS t(pid, q, c)`,
+      [po, req.storeId, pids, qtys, costs]
+    );
+    await c.query(
+      `INSERT INTO audit_log (store_id, user_id, action, table_name, record_id, details) VALUES ($1,$2,'po_created','purchase_orders',$3,$4)`,
+      [req.storeId, req.user.id, String(po), JSON.stringify({ lines: pids.length })]
+    );
+    await c.query('COMMIT');
+    res.status(201).json({ po_id: po });
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {});
+    if (e.code === '23503') return res.status(400).json({ error: 'A product was not found in this store' });
+    throw e;
+  } finally {
+    c.release();
+  }
+}));
+
+app.post('/api/purchase-orders/:id/receive', auth, store, allow(...BUY), async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const rec = (req.body && req.body.received) || {};
+  const pids = [], qs = [];
+  for (const [k, v] of Object.entries(rec)) {
+    const pid = parseInt(k, 10), q = Number(v);
+    if (!Number.isInteger(pid) || !Number.isInteger(q) || q < 0 || q > 1000000)
+      return res.status(400).json({ error: 'Received quantities must be whole numbers, 0 or more' });
+    pids.push(pid); qs.push(q);
+  }
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad purchase order' });
+  try {
+    await pool.query('SELECT fn_receive_po($1,$2,$3,$4::int[],$5::int[])', [req.storeId, id, req.user.id, pids, qs]);
+    res.json({ ok: true });
+  } catch (e) {
+    dbMsg(e, res);
+  }
+});
+
+app.post('/api/purchase-orders/:id/cancel', auth, store, allow(...BUY), wrap(async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad purchase order' });
+  const r = await pool.query(
+    `UPDATE purchase_orders SET status = 'cancelled' WHERE po_id = $1 AND store_id = $2 AND status = 'ordered' RETURNING po_id`,
+    [id, req.storeId]
+  );
+  if (!r.rowCount) return res.status(400).json({ error: 'Only an ordered purchase order can be cancelled' });
+  res.json({ ok: true });
+}));
+
 module.exports = app;
-                                            
+      
