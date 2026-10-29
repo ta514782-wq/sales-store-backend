@@ -25,18 +25,18 @@ const FILTER_CTE = `WITH f AS (
     AND o.store_id = $4
 ) `;
 const Q = {
-  overview: `SELECT count(*) AS total_orders,
-    count(*) FILTER (WHERE status='delivered') AS delivered_orders,
+  overview: `SELECT count(DISTINCT sale_id) AS total_orders,
+    count(DISTINCT sale_id) FILTER (WHERE status='delivered') AS delivered_orders,
     COALESCE(sum(total_price) FILTER (WHERE status='delivered'),0) AS revenue,
-    round(avg(total_price) FILTER (WHERE status='delivered'),2) AS avg_order_value,
+    round(sum(total_price) FILTER (WHERE status='delivered') / NULLIF(count(DISTINCT sale_id) FILTER (WHERE status='delivered'),0),2) AS avg_order_value,
     count(DISTINCT customer_id) AS customers,
-    round(100.0*count(*) FILTER (WHERE status IN ('cancelled','returned'))/NULLIF(count(*),0),2) AS cancel_return_pct
+    round(100.0*count(DISTINCT sale_id) FILTER (WHERE status IN ('cancelled','returned'))/NULLIF(count(DISTINCT sale_id),0),2) AS cancel_return_pct
     FROM f`,
   top_products: `SELECT product_name, category_name, sum(quantity) AS units_sold, sum(total_price) AS revenue
     FROM f WHERE status='delivered' GROUP BY 1,2 ORDER BY units_sold DESC LIMIT 5`,
   cancelled_products: `SELECT product_name, category_name, count(*) AS cancelled_orders
     FROM f WHERE status='cancelled' GROUP BY 1,2 ORDER BY cancelled_orders DESC LIMIT 10`,
-  top_customers: `SELECT customer_id, customer_name, count(*) AS orders, sum(total_price) AS total_spent
+  top_customers: `SELECT customer_id, customer_name, count(DISTINCT sale_id) AS orders, sum(total_price) AS total_spent
     FROM f WHERE status='delivered' AND customer_id IS NOT NULL GROUP BY 1,2 ORDER BY total_spent DESC LIMIT 5`,
   revenue_by_category: `SELECT category_name, sum(total_price) AS revenue, sum(quantity) AS units
     FROM f WHERE status='delivered' GROUP BY 1 ORDER BY revenue DESC`,
@@ -45,23 +45,23 @@ const Q = {
     count(*) FILTER (WHERE status='returned') AS returned,
     round(100.0*count(*) FILTER (WHERE status IN ('cancelled','returned'))/count(*),2) AS cancel_return_pct
     FROM f GROUP BY 1 ORDER BY cancel_return_pct DESC`,
-  payment_modes: `SELECT payment_mode, count(*) AS orders,
-    round(100.0*count(*)/sum(count(*)) OVER (),2) AS pct
+  payment_modes: `SELECT payment_mode, count(DISTINCT sale_id) AS orders,
+    round(100.0*count(DISTINCT sale_id)/sum(count(DISTINCT sale_id)) OVER (),2) AS pct
     FROM f WHERE payment_mode IS NOT NULL GROUP BY 1 ORDER BY orders DESC`,
   age_behavior: `SELECT CASE WHEN age<=25 THEN '18-25' WHEN age<=35 THEN '26-35'
       WHEN age<=45 THEN '36-45' ELSE '46-60' END AS age_group,
-    count(*) AS orders,
+    count(DISTINCT sale_id) AS orders,
     COALESCE(sum(total_price) FILTER (WHERE status='delivered'),0) AS revenue,
-    round(avg(total_price),2) AS avg_order_value
+    round(sum(total_price) / NULLIF(count(DISTINCT sale_id),0),2) AS avg_order_value
     FROM f WHERE age IS NOT NULL GROUP BY 1 ORDER BY 1`,
-  monthly_sales: `SELECT to_char(date_trunc('month', purchase_date),'YYYY-MM') AS month, count(*) AS orders,
+  monthly_sales: `SELECT to_char(date_trunc('month', purchase_date),'YYYY-MM') AS month, count(DISTINCT sale_id) AS orders,
     COALESCE(sum(total_price) FILTER (WHERE status='delivered'),0) AS revenue
     FROM f WHERE purchase_date IS NOT NULL GROUP BY 1 ORDER BY 1`,
   gender_category: `SELECT gender, category_name, count(*) AS orders, sum(quantity) AS units
     FROM f WHERE gender IS NOT NULL GROUP BY 1,2 ORDER BY 2,1`,
-  peak_hours: `SELECT EXTRACT(HOUR FROM purchase_time)::int AS hour_of_day, count(*) AS orders
+  peak_hours: `SELECT EXTRACT(HOUR FROM purchase_time)::int AS hour_of_day, count(DISTINCT sale_id) AS orders
     FROM f WHERE purchase_time IS NOT NULL GROUP BY 1 ORDER BY 2 DESC`,
-  order_status: `SELECT status, count(*) AS orders, sum(total_price) AS value
+  order_status: `SELECT status, count(DISTINCT sale_id) AS orders, sum(total_price) AS value
     FROM f GROUP BY 1 ORDER BY orders DESC`,
   lost_revenue: `SELECT to_char(date_trunc('month', purchase_date),'YYYY-MM') AS month,
     COALESCE(sum(total_price) FILTER (WHERE status='cancelled'),0) AS cancelled_value,
@@ -114,9 +114,8 @@ function buildForecast(hist) {
     linear: R(linear), ma3: R(ma3), low: R(Math.max(0, linear - half)), high: R(linear + half),
     r2: Math.round(r2 * 100) / 100, slope: R(b),
   };
-}
-
-const wrap = (fn) => (req, res) =>
+    }
+    const wrap = (fn) => (req, res) =>
   fn(req, res).catch((e) => {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
@@ -168,7 +167,6 @@ async function store(req, res, next) {
     res.status(500).json({ error: 'Server error' });
   }
 }
-
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.post('/api/login', wrap(async (req, res) => {
@@ -226,7 +224,6 @@ app.get('/api/me', auth, wrap(async (req, res) => {
   }
   res.json(out);
 }));
-
 app.get('/api/categories', auth, store, wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT category_name FROM categories WHERE store_id = $1 ORDER BY 1', [req.storeId]);
   res.json(rows.map((r) => r.category_name));
@@ -269,10 +266,10 @@ app.get('/api/dashboard/:key', auth, store, wrap(async (req, res) => {
       const { rows } = await pool.query(
         `SELECT to_char(date_trunc('month', o.purchase_date),'YYYY-MM') AS month,
            COALESCE(sum(o.total_price) FILTER (WHERE o.status='delivered' AND ($1::text IS NULL OR c.category_name=$1)),0) AS revenue,
-           count(*) FILTER (WHERE $1::text IS NULL OR c.category_name=$1) AS orders
+           count(DISTINCT o.sale_id) FILTER (WHERE $1::text IS NULL OR c.category_name=$1) AS orders
          FROM orders o JOIN products p USING (product_id) JOIN categories c USING (category_id)
          WHERE o.purchase_date IS NOT NULL AND o.store_id = $2
-         GROUP BY 1 HAVING count(*) >= 30
+         GROUP BY 1 HAVING count(DISTINCT o.sale_id) >= 30
          ORDER BY 1 DESC LIMIT 12`,
         [cat, req.storeId]
       );
@@ -311,7 +308,6 @@ app.get('/api/users', auth, store, superOnly, wrap(async (req, res) => {
   );
   res.json(rows);
 }));
-
 app.post('/api/users', auth, store, superOnly, wrap(async (req, res) => {
   const { full_name, email, password, role_name } = req.body || {};
   if (!full_name || !email || !password || password.length < 8 || !role_name)
@@ -388,7 +384,6 @@ app.get('/api/stores', auth, platformOnly, wrap(async (req, res) => {
   );
   res.json(rows);
 }));
-
 app.post('/api/stores', auth, platformOnly, async (req, res) => {
   const { store_name, city, admin_name, admin_email, admin_password, copy_from } = req.body || {};
   if (!store_name || !admin_name || !admin_email || !admin_password || admin_password.length < 8)
@@ -458,19 +453,24 @@ const importFail = (res, errs) =>
 
 // ----- prices, products, tax -----
 app.get('/api/products', auth, store, allow('super_admin', 'store_manager', 'inventory'), wrap(async (req, res) => {
+  const q = '%' + cleanText(req.query.q || '') + '%';
+  const barcode = cleanText(req.query.barcode || '');
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
   const { rows } = await pool.query(
-    `SELECT p.product_id, p.product_name, c.category_name, p.unit_price,
+    `SELECT p.product_id, p.product_name, p.barcode, c.category_name, p.unit_price,
             COALESCE(i.stock_qty,0) AS stock_qty, st.tax_rate
      FROM products p
      JOIN categories c ON c.category_id = p.category_id
      JOIN stores st ON st.store_id = p.store_id
      LEFT JOIN inventory i ON i.product_id = p.product_id AND i.store_id = p.store_id
-     WHERE p.store_id = $1 AND p.is_active ORDER BY c.category_name, p.product_name`,
-    [req.storeId]
+     WHERE p.store_id = $1 AND p.is_active
+       AND ($2::text = '' OR p.barcode = $2)
+       AND (p.product_name ILIKE $3 OR COALESCE(p.barcode,'') ILIKE $3)
+     ORDER BY c.category_name, p.product_name LIMIT $4`,
+    [req.storeId, barcode, q, limit]
   );
   res.json(rows);
 }));
-
 app.get('/api/store-settings', auth, store, wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT store_name, city, tax_rate FROM stores WHERE store_id = $1', [req.storeId]);
   res.json(rows[0]);
@@ -483,21 +483,24 @@ app.patch('/api/store-settings', auth, store, allow('super_admin'), wrap(async (
   res.json({ ok: true });
 }));
 
+const BARCODE_OK = /^[A-Za-z0-9-]{3,40}$/;
 app.post('/api/products', auth, store, allow('super_admin', 'inventory'), wrap(async (req, res) => {
   const b = req.body || {};
-  const name = cleanText(b.product_name), cat = cleanText(b.category);
+  const name = cleanText(b.product_name), cat = cleanText(b.category), barcode = cleanText(b.barcode);
   const price = Number(b.unit_price);
   const stock = b.opening_stock === undefined || b.opening_stock === '' ? 0 : Number(b.opening_stock);
   if (!name || name.length > 120 || !cat || cat.length > 60 || !(price >= 0 && price <= 1e9) || !Number.isInteger(stock) || stock < 0)
     return res.status(400).json({ error: 'Enter a name, a category, a price (0 or more) and a whole-number opening stock' });
+  if (barcode && !BARCODE_OK.test(barcode))
+    return res.status(400).json({ error: 'A barcode may contain only letters, numbers and dashes (3 to 40 characters)' });
   const c = await pool.connect();
   try {
     await c.query('BEGIN');
     const cid = await ensureCategory(c, req.storeId, cat);
     const ins = await c.query(
-      `INSERT INTO products (store_id, product_name, category_id, unit_price) VALUES ($1,$2,$3,$4)
+      `INSERT INTO products (store_id, product_name, category_id, unit_price, barcode) VALUES ($1,$2,$3,$4,$5)
        ON CONFLICT (store_id, product_name) DO NOTHING RETURNING product_id`,
-      [req.storeId, name, cid, price]
+      [req.storeId, name, cid, price, barcode || null]
     );
     if (!ins.rowCount) { await c.query('ROLLBACK'); return res.status(400).json({ error: 'A product with that name already exists' }); }
     const pid = ins.rows[0].product_id;
@@ -510,15 +513,15 @@ app.post('/api/products', auth, store, allow('super_admin', 'inventory'), wrap(a
     res.status(201).json({ product_id: pid });
   } catch (e) {
     await c.query('ROLLBACK').catch(() => {});
+    if (e.code === '23505') return res.status(400).json({ error: 'That barcode is already used by another product' });
     throw e;
   } finally {
     c.release();
   }
 }));
-
 app.patch('/api/products/:id', auth, store, allow('super_admin', 'inventory'), wrap(async (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const { unit_price, is_active } = req.body || {};
+  const { unit_price, is_active, barcode } = req.body || {};
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad product' });
   const sets = [], vals = [];
   if (unit_price !== undefined) {
@@ -527,17 +530,27 @@ app.patch('/api/products/:id', auth, store, allow('super_admin', 'inventory'), w
     vals.push(p); sets.push('unit_price = $' + vals.length);
   }
   if (is_active !== undefined) { vals.push(!!is_active); sets.push('is_active = $' + vals.length); }
+  if (barcode !== undefined) {
+    const bc = cleanText(barcode);
+    if (bc && !BARCODE_OK.test(bc)) return res.status(400).json({ error: 'A barcode may contain only letters, numbers and dashes (3 to 40 characters)' });
+    vals.push(bc || null); sets.push('barcode = $' + vals.length);
+  }
   if (!sets.length) return res.status(400).json({ error: 'Nothing to change' });
   vals.push(id, req.storeId);
-  const r = await pool.query(`UPDATE products SET ${sets.join(', ')} WHERE product_id = $${vals.length - 1} AND store_id = $${vals.length}`, vals);
-  if (!r.rowCount) return res.status(404).json({ error: 'Product not found' });
-  res.json({ ok: true });
+  try {
+    const r = await pool.query(`UPDATE products SET ${sets.join(', ')} WHERE product_id = $${vals.length - 1} AND store_id = $${vals.length}`, vals);
+    if (!r.rowCount) return res.status(404).json({ error: 'Product not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'That barcode is already used by another product' });
+    throw e;
+  }
 }));
 
 // ----- CSV imports (all or nothing: one bad row cancels the whole import) -----
 app.post('/api/import/products', auth, store, allow('super_admin', 'inventory'), wrap(async (req, res) => {
   const rows = importRows(req, res); if (!rows) return;
-  const errs = [], seen = new Set(), items = [];
+  const errs = [], seen = new Set(), seenBc = new Set(), items = [];
   rows.forEach((r, i) => {
     const n = 'Row ' + (i + 1);
     const name = cleanText(pick(r, ['product_name', 'name', 'product']));
@@ -545,6 +558,7 @@ app.post('/api/import/products', auth, store, allow('super_admin', 'inventory'),
     const priceRaw = pick(r, ['unit_price', 'price']);
     const stockRaw = pick(r, ['opening_stock', 'stock', 'quantity']);
     const reoRaw = pick(r, ['reorder_level', 'reorder']);
+    const bcRaw = cleanText(pick(r, ['barcode', 'bar_code', 'ean', 'upc']));
     const price = Number(priceRaw), stock = stockRaw === '' ? 0 : Number(stockRaw), reorder = reoRaw === '' ? null : Number(reoRaw);
     if (!name) errs.push(`${n}: product name is empty`);
     else if (name.length > 120) errs.push(`${n}: product name is too long`);
@@ -554,7 +568,9 @@ app.post('/api/import/products', auth, store, allow('super_admin', 'inventory'),
     if (priceRaw === '' || !(price >= 0 && price <= 1e9)) errs.push(`${n}: price must be a number, 0 or more`);
     if (!Number.isInteger(stock) || stock < 0) errs.push(`${n}: opening stock must be a whole number, 0 or more`);
     if (reorder !== null && (!Number.isInteger(reorder) || reorder < 0)) errs.push(`${n}: reorder level must be a whole number`);
-    items.push({ name, cat, price, stock, reorder });
+    if (bcRaw && !BARCODE_OK.test(bcRaw)) errs.push(`${n}: barcode may contain only letters, numbers and dashes (3 to 40 characters)`);
+    else if (bcRaw) { if (seenBc.has(bcRaw)) errs.push(`${n}: barcode ${bcRaw} appears twice in the file`); seenBc.add(bcRaw); }
+    items.push({ name, cat, price, stock, reorder, barcode: bcRaw });
   });
   if (errs.length) return importFail(res, errs);
   const c = await pool.connect();
@@ -584,6 +600,13 @@ app.post('/api/import/products', auth, store, allow('super_admin', 'inventory'),
        RETURNING product_id, product_name, (xmax = 0) AS inserted`,
       [req.storeId, items.map((x) => x.name), items.map((x) => x.cat), items.map((x) => x.price)]
     );
+    const bcs = items.filter((x) => x.barcode);
+    if (bcs.length)
+      await c.query(
+        `UPDATE products p SET barcode = t.b FROM unnest($2::text[], $3::text[]) AS t(name, b)
+         WHERE p.store_id = $1 AND p.product_name = t.name`,
+        [req.storeId, bcs.map((x) => x.name), bcs.map((x) => x.barcode)]
+      );
     const byName = new Map(items.map((i) => [i.name, i]));
     const created = up.rows.filter((r) => r.inserted);
     const ids = [], stk = [], reo = [];
@@ -609,12 +632,12 @@ app.post('/api/import/products', auth, store, allow('super_admin', 'inventory'),
     res.json({ created: created.length, updated: up.rows.length - created.length });
   } catch (e) {
     await c.query('ROLLBACK').catch(() => {});
+    if (e.code === '23505') return res.status(400).json({ error: 'A barcode in the file is already used by another product. Nothing was imported.' });
     throw e;
   } finally {
     c.release();
   }
 }));
-
 app.post('/api/import/customers', auth, store, allow('super_admin', 'store_manager'), wrap(async (req, res) => {
   const rows = importRows(req, res); if (!rows) return;
   const errs = [], names = [], ages = [], genders = [];
@@ -715,74 +738,100 @@ app.post('/api/customers', auth, store, allow('super_admin', 'store_manager'), w
   res.status(201).json(rows[0]);
 }));
 
-app.get('/api/orders', auth, store, allow('super_admin', 'store_manager', 'logistics'), wrap(async (req, res) => {
+// ----- sales: a basket with one or more lines (the lines live in the orders table) -----
+app.get('/api/sales', auth, store, allow('super_admin', 'store_manager', 'logistics'), wrap(async (req, res) => {
   const st = STATUSES.includes(req.query.status) ? req.query.status : null;
-  const q = '%' + (req.query.q || '') + '%';
+  const q = '%' + cleanText(req.query.q || '') + '%';
   const { rows } = await pool.query(
-    `SELECT o.transaction_id, cu.customer_name, p.product_name, o.quantity, o.total_price,
-            o.status, o.purchase_date, o.purchase_time
-     FROM orders o LEFT JOIN customers cu USING (customer_id) JOIN products p USING (product_id)
-     WHERE o.store_id = $3 AND ($1::text IS NULL OR o.status = $1) AND o.transaction_id ILIKE $2
-     ORDER BY o.purchase_date DESC NULLS LAST, o.purchase_time DESC NULLS LAST LIMIT 30`,
+    `SELECT s.sale_id, cu.customer_name, count(o.transaction_id) AS items, sum(o.quantity) AS units,
+            sum(o.total_price) AS total,
+            CASE WHEN count(DISTINCT o.status) = 1 THEN min(o.status) ELSE 'mixed' END AS status,
+            min(o.purchase_date) AS purchase_date, min(o.purchase_time) AS purchase_time
+     FROM sales s JOIN orders o ON o.sale_id = s.sale_id
+     LEFT JOIN customers cu ON cu.customer_id = s.customer_id AND cu.store_id = s.store_id
+     WHERE s.store_id = $3 AND ($1::text IS NULL OR o.status = $1)
+       AND (s.sale_id::text ILIKE $2 OR COALESCE(cu.customer_name,'') ILIKE $2)
+     GROUP BY s.sale_id, cu.customer_name ORDER BY s.sale_id DESC LIMIT 30`,
     [st, q, req.storeId]
   );
   res.json(rows);
 }));
-
-// one order with full price breakdown (for the receipt)
-app.get('/api/orders/:id', auth, store, allow('super_admin', 'store_manager', 'logistics'), wrap(async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT o.transaction_id, o.status, o.purchase_date, o.purchase_time, o.quantity, o.subtotal, o.discount,
-            o.tax, o.total_price, o.payment_mode, cu.customer_name, p.product_name, s.store_name, s.city,
-            CASE WHEN o.subtotal IS NOT NULL THEN round(o.subtotal / o.quantity, 2) END AS unit_price
-     FROM orders o JOIN stores s ON s.store_id = o.store_id
-     JOIN products p ON p.product_id = o.product_id
-     LEFT JOIN customers cu ON cu.customer_id = o.customer_id
-     WHERE o.transaction_id = $1 AND o.store_id = $2`,
-    [req.params.id, req.storeId]
+// one sale with every line and the price breakdown (for the receipt)
+app.get('/api/sales/:id', auth, store, allow('super_admin', 'store_manager', 'logistics'), wrap(async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad sale' });
+  const h = await pool.query(
+    `SELECT s.sale_id, s.payment_mode, s.discount_pct, st.store_name, st.city, cu.customer_name,
+            min(o.purchase_date) AS purchase_date, min(o.purchase_time) AS purchase_time,
+            CASE WHEN count(DISTINCT o.status) = 1 THEN min(o.status) ELSE 'mixed' END AS status,
+            sum(o.subtotal) AS subtotal, sum(o.discount) AS discount, sum(o.tax) AS tax,
+            sum(o.total_price) AS total, (count(o.subtotal) = count(*)) AS has_breakdown
+     FROM sales s JOIN stores st ON st.store_id = s.store_id JOIN orders o ON o.sale_id = s.sale_id
+     LEFT JOIN customers cu ON cu.customer_id = s.customer_id AND cu.store_id = s.store_id
+     WHERE s.sale_id = $1 AND s.store_id = $2
+     GROUP BY s.sale_id, st.store_name, st.city, cu.customer_name`,
+    [id, req.storeId]
   );
-  if (!rows.length) return res.status(404).json({ error: 'Order not found' });
-  res.json(rows[0]);
+  if (!h.rowCount) return res.status(404).json({ error: 'Sale not found' });
+  const l = await pool.query(
+    `SELECT p.product_name, o.quantity, o.subtotal, o.discount, o.tax, o.total_price,
+            CASE WHEN o.subtotal IS NOT NULL THEN round(o.subtotal / o.quantity, 2) END AS unit_price
+     FROM orders o JOIN products p ON p.product_id = o.product_id AND p.store_id = o.store_id
+     WHERE o.sale_id = $1 AND o.store_id = $2 ORDER BY p.product_name`,
+    [id, req.storeId]
+  );
+  res.json({ ...h.rows[0], lines: l.rows });
 }));
 
-// the price is calculated by the database (fn_place_order), not sent by the browser
-app.post('/api/orders', auth, store, allow('super_admin', 'store_manager'), async (req, res) => {
-  const { customer_id, product_id, quantity, discount_pct, payment_mode } = req.body || {};
+// checkout: prices, discount and tax are calculated by the database (fn_place_sale)
+app.post('/api/sales', auth, store, allow('super_admin', 'store_manager'), async (req, res) => {
+  const { customer_id, payment_mode, discount_pct, deliver, items } = req.body || {};
   const disc = discount_pct === undefined || discount_pct === '' ? 0 : Number(discount_pct);
-  if (!customer_id || !Number.isInteger(product_id) || !Number.isInteger(quantity) || quantity < 1 ||
-      !(disc >= 0 && disc <= 100) || !PAY.includes(payment_mode))
-    return res.status(400).json({ error: 'Fill customer, product, quantity (1+), discount (0-100) and payment mode' });
+  if (!Array.isArray(items) || !items.length || items.length > 200 || !PAY.includes(payment_mode) || !(disc >= 0 && disc <= 100))
+    return res.status(400).json({ error: 'Add at least one product, choose a payment mode, and keep the discount between 0 and 100' });
+  const pids = [], qtys = [];
+  for (const it of items) {
+    if (!Number.isInteger(it.product_id) || !Number.isInteger(it.qty) || it.qty < 1 || it.qty > 100000)
+      return res.status(400).json({ error: 'Every line needs a product and a whole quantity of 1 or more' });
+    pids.push(it.product_id); qtys.push(it.qty);
+  }
   try {
-    const r = await pool.query('SELECT fn_place_order($1,$2,$3,$4,$5,$6) AS tid',
-      [req.storeId, customer_id, product_id, quantity, disc, payment_mode]);
-    const o = await pool.query('SELECT transaction_id, subtotal, discount, tax, total_price FROM orders WHERE transaction_id = $1', [r.rows[0].tid]);
-    res.status(201).json(o.rows[0]);
+    const r = await pool.query('SELECT fn_place_sale($1,$2,$3,$4,$5,$6,$7::int[],$8::int[]) AS sid',
+      [req.storeId, customer_id || null, payment_mode, disc, deliver === true, req.user.id, pids, qtys]);
+    const t = await pool.query(
+      'SELECT sum(subtotal) AS subtotal, sum(discount) AS discount, sum(tax) AS tax, sum(total_price) AS total, min(status) AS status FROM orders WHERE sale_id = $1',
+      [r.rows[0].sid]
+    );
+    res.status(201).json({ sale_id: r.rows[0].sid, ...t.rows[0] });
   } catch (e) {
     dbMsg(e, res);
   }
 });
-
-// change order status (rules: pending -> delivered/cancelled, delivered -> returned)
-app.patch('/api/orders/:id/status', auth, store, allow('super_admin', 'store_manager', 'logistics'), async (req, res) => {
+// change a sale's status: every line changes together (rules: pending -> delivered/cancelled, delivered -> returned)
+app.patch('/api/sales/:id/status', auth, store, allow('super_admin', 'store_manager', 'logistics'), async (req, res) => {
+  const id = parseInt(req.params.id, 10);
   const { status } = req.body || {};
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad sale' });
   const c = await pool.connect();
   try {
     await c.query('BEGIN');
-    const cur = await c.query(
-      'SELECT status FROM orders WHERE transaction_id = $1 AND store_id = $2 FOR UPDATE',
-      [req.params.id, req.storeId]
+    const lines = await c.query(
+      'SELECT transaction_id, status FROM orders WHERE sale_id = $1 AND store_id = $2 FOR UPDATE',
+      [id, req.storeId]
     );
-    if (!cur.rowCount) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Order not found' }); }
-    const from = cur.rows[0].status;
-    if (!(NEXT[from] || []).includes(status)) {
+    if (!lines.rowCount) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Sale not found' }); }
+    const sts = [...new Set(lines.rows.map((r) => r.status))];
+    if (sts.length !== 1) { await c.query('ROLLBACK'); return res.status(400).json({ error: 'This sale has lines with different statuses' }); }
+    if (!(NEXT[sts[0]] || []).includes(status)) {
       await c.query('ROLLBACK');
-      return res.status(400).json({ error: `A ${from} order cannot become ${status}` });
+      return res.status(400).json({ error: `A ${sts[0]} sale cannot become ${status}` });
     }
-    await c.query('UPDATE orders SET status = $1 WHERE transaction_id = $2 AND store_id = $3', [status, req.params.id, req.storeId]);
+    await c.query('UPDATE orders SET status = $1 WHERE sale_id = $2 AND store_id = $3', [status, id, req.storeId]);
     await c.query(
-      `UPDATE audit_log SET user_id = $1 WHERE audit_id =
-         (SELECT max(audit_id) FROM audit_log WHERE action = 'status_change' AND record_id = $2)`,
-      [req.user.id, req.params.id]
+      `UPDATE audit_log SET user_id = $1
+       WHERE action = 'status_change' AND store_id = $2 AND user_id IS NULL AND created_at = now()
+         AND record_id = ANY($3::text[])`,
+      [req.user.id, req.storeId, lines.rows.map((r) => r.transaction_id)]
     );
     await c.query('COMMIT');
     res.json({ ok: true });
@@ -862,7 +911,6 @@ app.get('/api/purchase-orders', auth, store, allow('super_admin', 'inventory', '
   );
   res.json(rows);
 }));
-
 app.get('/api/purchase-orders/:id', auth, store, allow('super_admin', 'inventory', 'store_manager'), wrap(async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad purchase order' });
@@ -944,7 +992,6 @@ app.post('/api/purchase-orders/:id/receive', auth, store, allow(...BUY), async (
     dbMsg(e, res);
   }
 });
-
 app.post('/api/purchase-orders/:id/cancel', auth, store, allow(...BUY), wrap(async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad purchase order' });
@@ -957,4 +1004,3 @@ app.post('/api/purchase-orders/:id/cancel', auth, store, allow(...BUY), wrap(asy
 }));
 
 module.exports = app;
-      
